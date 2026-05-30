@@ -1,0 +1,22 @@
+mx_28_control:
+  ros__parameters:
+    vision_topic: "/detection"
+    output_topic: "/gripper/mx28_angle"
+    tick_hz: 25.0
+
+    target_class_id: -1
+    min_score: 0.5
+
+    target_y: 240.0
+    deadband_y: 20.0
+
+    initial_angle: 150.0
+    min_angle: 80.0
+    max_angle: 220.0
+
+    kp: 0.05
+    max_step_per_tick: 2.0
+    invert_direction: false
+
+    stale_timeout_sec: 0.5
+    publish_hold_angle_when_lost: true
