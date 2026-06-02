@@ -7,6 +7,7 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64
+from std_msgs.msg import String
 
 from client_vision_interfaces.msg import TurtlebotDetection
 
@@ -24,8 +25,8 @@ def mx_28_controller(
     edge_margin = 5.0
     shelf_y_threshold = 400.0
     travel_angle = 175.0
-    shelf_angle = 210.0
-    angle_speed_ratio = 0.75
+    shelf_angle = 195.0
+    angle_speed_ratio = 0.9
 
     #---------------- 입력 검사
     sizes = [
@@ -65,17 +66,17 @@ def mx_28_controller(
     target_angle = travel_angle
 
     if current_angle < shelf_angle - 10.0: #낮은 앵글일 시
-        if y1 ==0 and y2 < 440:
+        if y1 ==0 and y2 < 400:
             target_angle = shelf_angle
         else:
             target_angle = travel_angle
         
     else:#높은 앵글일 시
-        if x2 - x1 < 160:
+        if x2 - x1 < 100:
             target_angle = travel_angle
         else:
             target_angle = shelf_angle
-    if target_class_id == 2:
+    if target_class_id == 1:
         target_angle = travel_angle
 
     return current_angle + (target_angle - current_angle) * angle_speed_ratio
@@ -87,6 +88,8 @@ class Mx28Node(Node):
 
         self.declare_parameter('vision_topic', '/detection')
         self.declare_parameter('output_topic', '/gripper/mx28_angle')
+        self.declare_parameter('gripper_state_topic', '/gripper/state')
+        self.declare_parameter('servo_present_angle_topic', '/gripper/servo_present_angle')
         self.declare_parameter('tick_hz', 20.0)
         self.declare_parameter('target_class_id', -1)
         self.declare_parameter('min_score', 0.5)
@@ -103,6 +106,10 @@ class Mx28Node(Node):
 
         self.vision_topic = str(self.get_parameter('vision_topic').value)
         self.output_topic = str(self.get_parameter('output_topic').value)
+        self.gripper_state_topic = str(self.get_parameter('gripper_state_topic').value)
+        self.servo_present_angle_topic = str(
+            self.get_parameter('servo_present_angle_topic').value
+        )
         self.tick_hz = float(self.get_parameter('tick_hz').value)
         self.target_class_id = int(self.get_parameter('target_class_id').value)
         self.min_score = float(self.get_parameter('min_score').value)
@@ -126,12 +133,31 @@ class Mx28Node(Node):
         self._has_logged_first_vision = False
         self._last_warn_monotonic_ns = 0
         self._last_published_angle = None
+        self.gripper_state = "idle"
+        self.gripped_start_ns = None
+        self.released_start_ns = None
+        self.servo_close_start_ns = None
+        self.current_servo_angle = None
+        self.grip_start_servo_angle = None
+        self.release_start_servo_angle = None
 
         self.angle_pub = self.create_publisher(Float64, self.output_topic, 10)
         self.vision_sub = self.create_subscription(
             TurtlebotDetection,
             self.vision_topic,
             self.vision_callback,
+            10,
+        )
+        self.gripper_state_sub = self.create_subscription(
+            String,
+            self.gripper_state_topic,
+            self.gripper_state_callback,
+            10,
+        )
+        self.servo_present_angle_sub = self.create_subscription(
+            Float64,
+            self.servo_present_angle_topic,
+            self.servo_present_angle_callback,
             10,
         )
 
@@ -141,6 +167,8 @@ class Mx28Node(Node):
         self.get_logger().info(
             'mx_28_control started: '
             f'vision_topic={self.vision_topic}, output_topic={self.output_topic}, '
+            f'gripper_state_topic={self.gripper_state_topic}, '
+            f'servo_present_angle_topic={self.servo_present_angle_topic}, '
             f'tick_hz={self.tick_hz:.1f}, target_class_id={self.target_class_id}, '
             f'target_y={self.target_y:.1f}, deadband_y={self.deadband_y:.1f}, '
             f'angle_range=[{self.min_angle:.1f}, {self.max_angle:.1f}], '
@@ -157,6 +185,30 @@ class Mx28Node(Node):
             self._has_logged_first_vision = True
             self.get_logger().info(f'Vision stream detected on {self.vision_topic}')
 
+    def gripper_state_callback(self, msg: String):
+        self.gripper_state = msg.data
+        if msg.data == "gripped":
+            self.gripped_start_ns = self.get_clock().now().nanoseconds
+            self.released_start_ns = None
+            self.servo_close_start_ns = None
+            self.grip_start_servo_angle = self.current_servo_angle
+            self.release_start_servo_angle = None
+        elif msg.data == "released":
+            self.released_start_ns = self.get_clock().now().nanoseconds
+            self.gripped_start_ns = None
+            self.servo_close_start_ns = None
+            self.grip_start_servo_angle = None
+            self.release_start_servo_angle = self.current_servo_angle
+        else:
+            self.gripped_start_ns = None
+            self.released_start_ns = None
+            self.servo_close_start_ns = None
+            self.grip_start_servo_angle = None
+            self.release_start_servo_angle = None
+
+    def servo_present_angle_callback(self, msg: Float64):
+        self.current_servo_angle = float(msg.data)
+
     def tick(self):
         # 저장된 비전으로 주기 제어
         with self._vision_mutex:
@@ -165,6 +217,38 @@ class Mx28Node(Node):
         now_ns = self.get_clock().now().nanoseconds
         hold_msg = Float64()
         hold_msg.data = float(self.current_angle)
+
+        if self.gripper_state == "gripped":
+            if self.current_servo_angle is None:
+                self.angle_pub.publish(hold_msg)
+                return
+            if self.current_servo_angle > 70.0:
+                self.angle_pub.publish(hold_msg)
+                return
+            if self.servo_close_start_ns is None:
+                self.servo_close_start_ns = now_ns
+                self.angle_pub.publish(hold_msg)
+                return
+            if (now_ns - self.servo_close_start_ns) < int(4.3 * 1e9):
+                self.angle_pub.publish(hold_msg)
+                return
+            self.current_angle = 220.0
+            hold_msg.data = 220.0
+            self.angle_pub.publish(hold_msg)
+            return
+
+        if self.gripper_state == "released":
+            if self.current_servo_angle is None:
+                self.angle_pub.publish(hold_msg)
+                return
+            if self.current_servo_angle < 150.0:
+                self.angle_pub.publish(hold_msg)
+                return
+            self.current_angle = 175.0
+            hold_msg.data = 175.0
+            self.angle_pub.publish(hold_msg)
+            self.gripper_state = "idle"
+            self.servo_close_start_ns = None
 
         if vision_msg is None or vision_time_ns is None:
             if now_ns - self._last_warn_monotonic_ns >= int(1.0 * 1e9):
